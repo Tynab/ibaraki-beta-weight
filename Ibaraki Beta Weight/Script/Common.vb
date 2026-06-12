@@ -1,25 +1,31 @@
 ﻿Imports System.Console
 Imports System.ConsoleColor
-Imports System.Diagnostics.Process
 Imports System.IO
-Imports System.IO.Directory
 Imports System.Net
 Imports System.Runtime.CompilerServices
+Imports System.Runtime.InteropServices
 Imports System.Threading.Thread
 Imports System.Windows.Forms
 
+''' <summary>
+''' Cung cấp helper chung cho cập nhật ứng dụng, vòng đời Excel, nhập liệu console,
+''' định dạng console và thao tác ghi dữ liệu vào mẫu Excel.
+''' </summary>
 Friend Module Common
 #Region "Helper"
     ''' <summary>
-    ''' Check internet connection.
+    ''' Kiểm tra nhanh endpoint update có phản hồi hay không.
     ''' </summary>
-    ''' <returns>Connection state.</returns>
-    Private Function IsNetAvail()
-        Dim objResp As WebResponse
+    ''' <returns>True nếu kết nối tới endpoint cơ sở thành công.</returns>
+    Private Function IsNetAvail() As Boolean
         Try
-            objResp = WebRequest.Create(New Uri(My.Resources.link_base)).GetResponse
-            objResp.Close()
-            objResp = Nothing
+            Dim request = DirectCast(WebRequest.Create(New Uri(My.Resources.link_base)), HttpWebRequest)
+            request.Timeout = 5000
+            request.ReadWriteTimeout = 5000
+
+            Using response As WebResponse = request.GetResponse()
+            End Using
+
             Return True
         Catch ex As Exception
             Return False
@@ -27,19 +33,31 @@ Friend Module Common
     End Function
 
     ''' <summary>
-    ''' Check update.
+    ''' Kiểm tra phiên bản mới và mở form cập nhật khi server báo khác phiên bản hiện tại.
     ''' </summary>
     Private Sub ChkUpd()
         HdrSty("アップデートの確認...")
-        If IsNetAvail() AndAlso Not (New WebClient).DownloadString(My.Resources.link_ver).Contains(My.Resources.app_ver) Then
-            MsgBox($"「{My.Resources.app_true_name}」新しいバージョンが利用可能！", 262144, Title:="更新")
-            Dim frmUpd = New FrmUpdate
-            frmUpd.ShowDialog()
+
+        If Not IsNetAvail() Then
+            Return
         End If
+
+        Try
+            Using webClient As New WebClient()
+                If Not webClient.DownloadString(My.Resources.link_ver).Contains(My.Resources.app_ver) Then
+                    MsgBox($"「{My.Resources.app_true_name}」新しいバージョンが利用可能！", 262144, Title:="更新")
+                    Using frmUpd As New FrmUpdate()
+                        frmUpd.ShowDialog()
+                    End Using
+                End If
+            End Using
+        Catch ex As Exception
+            ErrSty("アップデートの確認に失敗しました。既存バージョンで続行します..." & vbCrLf)
+        End Try
     End Sub
 
     ''' <summary>
-    ''' Update valid license.
+    ''' Lưu trạng thái license hợp lệ vào user settings.
     ''' </summary>
     Friend Sub UpdVldLic()
         My.Settings.Chk_Key = True
@@ -47,7 +65,7 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Fade in form.
+    ''' Tăng dần độ trong suốt để form hiện ra mượt hơn.
     ''' </summary>
     <Extension()>
     Friend Sub FIFrm(frm As Form)
@@ -59,7 +77,7 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Fade out form.
+    ''' Giảm dần độ trong suốt để form đóng mượt hơn.
     ''' </summary>
     <Extension()>
     Friend Sub FOFrm(frm As Form)
@@ -73,19 +91,24 @@ Friend Module Common
 
 #Region "Master"
     ''' <summary>
-    ''' End process.
+    ''' Kết thúc tất cả tiến trình theo tên, dùng cho Excel và tiến trình app cũ sau khi update.
     ''' </summary>
-    ''' <param name="name">Process name.</param>
+    ''' <param name="name">Tên tiến trình không kèm phần mở rộng.</param>
     Friend Sub KillPrcs(name As String)
-        If GetProcessesByName(name).Count > 0 Then
-            For Each item In GetProcessesByName(name)
+        For Each item As Process In Process.GetProcessesByName(name)
+            Try
                 item.Kill()
-            Next
-        End If
+                item.WaitForExit(5000)
+            Catch ex As Exception
+                ' Bỏ qua tiến trình đã thoát hoặc không có quyền, vì đây chỉ là bước dọn dẹp.
+            Finally
+                item.Dispose()
+            End Try
+        Next
     End Sub
 
     ''' <summary>
-    ''' Kill excel.
+    ''' Nhắc người dùng đóng Excel rồi dọn các tiến trình Excel còn sót để tránh khóa workbook.
     ''' </summary>
     Private Sub KillXl()
         Clear()
@@ -95,42 +118,89 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Run application.
+    ''' Nhả COM object của Excel nếu đã được tạo để hạn chế Excel.exe bị giữ lại.
+    ''' </summary>
+    ''' <param name="value">COM object cần nhả.</param>
+    Private Sub ReleaseComObjectSafe(value As Object)
+        If value IsNot Nothing AndAlso Marshal.IsComObject(value) Then
+            Marshal.FinalReleaseComObject(value)
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' Chạy luồng chính: kiểm tra update, chọn file Excel, ghi dữ liệu và mở lại file kết quả.
     ''' </summary>
     Friend Sub RunApp()
         ChkUpd()
         KillXl()
-        Dim xlApp As New Microsoft.Office.Interop.Excel.Application
-        Dim ofd As New OpenFileDialog With {
+
+        Using ofd As New OpenFileDialog With {
             .Multiselect = False,
             .Title = "「エクセル」ドキュメントを開く",
             .Filter = "「エクセル」ドキュメント|*.xlsx;*.xls"
         }
-        If ofd.ShowDialog() = DialogResult.OK Then
-            Dim filePath = ofd.FileName
-            xlApp.Workbooks.Open(filePath)
-            WtIbarakiBeta(xlApp)
-            xlApp.ActiveWorkbook.Close(SaveChanges:=True)
-            Process.Start(filePath)
-        End If
+            If ofd.ShowDialog() <> DialogResult.OK Then
+                Return
+            End If
+
+            Dim filePath As String = ofd.FileName
+            Dim xlApp As Microsoft.Office.Interop.Excel.Application = Nothing
+            Dim workbook As Microsoft.Office.Interop.Excel.Workbook = Nothing
+            Dim completed As Boolean = False
+
+            Try
+                xlApp = New Microsoft.Office.Interop.Excel.Application With {
+                    .DisplayAlerts = False
+                }
+                workbook = xlApp.Workbooks.Open(filePath)
+                WtIbarakiBeta(xlApp)
+                completed = True
+            Catch ex As Exception
+                ErrSty($"処理中にエラーが発生しました: {ex.Message}{vbCrLf}")
+            Finally
+                If workbook IsNot Nothing Then
+                    Try
+                        workbook.Close(SaveChanges:=completed)
+                    Catch ex As Exception
+                        ErrSty($"ワークブックを閉じる時にエラーが発生しました: {ex.Message}{vbCrLf}")
+                    Finally
+                        ReleaseComObjectSafe(workbook)
+                    End Try
+                End If
+
+                If xlApp IsNot Nothing Then
+                    Try
+                        xlApp.Quit()
+                    Catch ex As Exception
+                        ErrSty($"Excelを終了する時にエラーが発生しました: {ex.Message}{vbCrLf}")
+                    Finally
+                        ReleaseComObjectSafe(xlApp)
+                    End Try
+                End If
+            End Try
+
+            If completed Then
+                Process.Start(filePath)
+            End If
+        End Using
     End Sub
 #End Region
 
 #Region "Main"
     ''' <summary>
-    ''' Create directory advanced.
+    ''' Tạo thư mục nếu chưa tồn tại.
     ''' </summary>
-    ''' <param name="path">Folder path.</param>
+    ''' <param name="path">Đường dẫn thư mục.</param>
     Friend Sub CrtDirAdv(path As String)
-        If Not Exists(path) Then
-            CreateDirectory(path)
+        If Not Directory.Exists(path) Then
+            Directory.CreateDirectory(path)
         End If
     End Sub
 
     ''' <summary>
-    ''' Delete file advanced.
+    ''' Xóa file nếu đang tồn tại.
     ''' </summary>
-    ''' <param name="path">File path.</param>
+    ''' <param name="path">Đường dẫn file.</param>
     Friend Sub DelFileAdv(path As String)
         If File.Exists(path) Then
             File.Delete(path)
@@ -138,86 +208,103 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Header Yes/No question (1/0).
+    ''' Kiểm tra giá trị chọn 0/1.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    ''' <returns>Answer value.</returns>
-    Friend Function HdrYNQ(caption As String)
-        Dim value = HdrDWrng(caption)
-        If value <> 0 Or value <> 1 Then
-            Do Until value = 0 Or value = 1
-                value = HdrDErr(caption)
-            Loop
-        End If
+    ''' <param name="value">Giá trị người dùng nhập.</param>
+    ''' <returns>True nếu giá trị là 0 hoặc 1.</returns>
+    Private Function IsBinaryChoice(value As Double) As Boolean
+        Return value = 0 OrElse value = 1
+    End Function
+
+    ''' <summary>
+    ''' Hiển thị câu hỏi Yes/No ở cấp header và chỉ nhận giá trị 1/0.
+    ''' </summary>
+    ''' <param name="caption">Nhãn câu hỏi.</param>
+    ''' <returns>Giá trị chọn của người dùng.</returns>
+    Friend Function HdrYNQ(caption As String) As Double
+        Dim value As Double = HdrDWrng(caption)
+        Do Until IsBinaryChoice(value)
+            value = HdrDErr(caption)
+        Loop
         Return value
     End Function
 
     ''' <summary>
-    ''' Detail Yes/No question (1/0).
+    ''' Hiển thị câu hỏi Yes/No ở cấp detail và chỉ nhận giá trị 1/0.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    ''' <returns>Answer value.</returns>
-    Friend Function DtlYNQ(caption As String)
+    ''' <param name="caption">Nhãn câu hỏi.</param>
+    ''' <returns>Giá trị chọn của người dùng.</returns>
+    Friend Function DtlYNQ(caption As String) As Double
         PrefSel(caption)
-        Dim value = Val(ReadLine)
-        If value <> 0 Or value <> 1 Then
-            Do Until value = 0 Or value = 1
-                PrefWrng(caption)
-                value = Val(ReadLine)
-            Loop
-        End If
+        Dim value As Double = Val(ReadLine)
+        Do Until IsBinaryChoice(value)
+            PrefWrng(caption)
+            value = Val(ReadLine)
+        Loop
         Return value
     End Function
 
     ''' <summary>
-    ''' Direct value to excel.
+    ''' Ghi trực tiếp một giá trị vào ô Excel.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="cell">Cell address.</param>
-    ''' <param name="value">Value.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="cell">Địa chỉ ô.</param>
+    ''' <param name="value">Giá trị cần ghi.</param>
     Friend Sub DctVal(xlApp As Microsoft.Office.Interop.Excel.Application, cell As String, value As Object)
-        xlApp.Range(cell).Activate()
-        xlApp.ActiveCell.FormulaR1C1 = value
+        Dim target As Microsoft.Office.Interop.Excel.Range = xlApp.Range(cell)
+        Try
+            target.FormulaR1C1 = value
+        Finally
+            ReleaseComObjectSafe(target)
+        End Try
     End Sub
 
     ''' <summary>
-    ''' Mod value to excel.
+    ''' Ghi giá trị vào ô Excel và tô màu để đánh dấu dòng được tùy biến.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="cell">Cell address.</param>
-    ''' <param name="value">Value.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="cell">Địa chỉ ô.</param>
+    ''' <param name="value">Giá trị cần ghi.</param>
     Private Sub ModVal(xlApp As Microsoft.Office.Interop.Excel.Application, cell As String, value As Object)
-        xlApp.Range(cell).Activate()
-        xlApp.ActiveCell.FormulaR1C1 = value
-        xlApp.ActiveCell.Interior.Color = RGB(0, 176, 240)
+        Dim target As Microsoft.Office.Interop.Excel.Range = xlApp.Range(cell)
+        Try
+            target.FormulaR1C1 = value
+            target.Interior.Color = RGB(0, 176, 240)
+        Finally
+            ReleaseComObjectSafe(target)
+        End Try
     End Sub
 
     ''' <summary>
-    ''' Direct value to excel.
+    ''' Xóa nội dung của ô hoặc vùng merge chứa ô đó.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="cell">Cell address.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="cell">Địa chỉ ô.</param>
     Friend Sub ClrVal(xlApp As Microsoft.Office.Interop.Excel.Application, cell As String)
-        xlApp.Range(cell).Activate()
-        xlApp.ActiveCell.MergeArea.ClearContents()
+        Dim target As Microsoft.Office.Interop.Excel.Range = xlApp.Range(cell)
+        Try
+            target.MergeArea.ClearContents()
+        Finally
+            ReleaseComObjectSafe(target)
+        End Try
     End Sub
 
     ''' <summary>
-    ''' Publish string value to excel.
+    ''' Nhập chuỗi từ console rồi ghi vào ô Excel.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="caption">Caption.</param>
-    ''' <param name="cell">Cell address.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="caption">Nhãn nhập liệu.</param>
+    ''' <param name="cell">Địa chỉ ô.</param>
     Friend Sub PubSVal(xlApp As Microsoft.Office.Interop.Excel.Application, caption As String, cell As String)
         DctVal(xlApp, cell, DtlSInp(caption))
     End Sub
 
     ''' <summary>
-    ''' Publish double value to excel.
+    ''' Ghi số dương vào ô Excel, bỏ qua giá trị 0 hoặc âm.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="cell">Cell address.</param>
-    ''' <param name="value">Value.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="cell">Địa chỉ ô.</param>
+    ''' <param name="value">Giá trị số cần ghi.</param>
     Friend Sub PubDVal(xlApp As Microsoft.Office.Interop.Excel.Application, cell As String, value As Double)
         If value > 0 Then
             DctVal(xlApp, cell, value)
@@ -225,13 +312,13 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Publish double mod value to excel.
+    ''' Ghi một dòng thép tùy biến gồm tên, trọng lượng và số lượng.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="row">Row number.</param>
-    ''' <param name="name">Name rebar.</param>
-    ''' <param name="weight">Weight rebar.</param>
-    ''' <param name="number">Number rebar.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="row">Số dòng trong mẫu Excel.</param>
+    ''' <param name="name">Tên hoặc quy cách thép.</param>
+    ''' <param name="weight">Trọng lượng đơn vị.</param>
+    ''' <param name="number">Số lượng.</param>
     Friend Sub PubDModVal(xlApp As Microsoft.Office.Interop.Excel.Application, row As String, name As String, weight As Double, number As Double)
         If number > 0 Then
             DctVal(xlApp, $"AH{row}", name)
@@ -241,14 +328,14 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Publish double mod value to excel.
+    ''' Ghi một dòng thép tùy biến có thêm tiêu đề/ghi chú phân loại.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="row">Row number.</param>
-    ''' <param name="title">Title rebar.</param>
-    ''' <param name="name">Name rebar.</param>
-    ''' <param name="weight">Weight rebar.</param>
-    ''' <param name="number">Number rebar.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="row">Số dòng trong mẫu Excel.</param>
+    ''' <param name="title">Tiêu đề hoặc loại thép.</param>
+    ''' <param name="name">Tên hoặc quy cách thép.</param>
+    ''' <param name="weight">Trọng lượng đơn vị.</param>
+    ''' <param name="number">Số lượng.</param>
     Friend Sub PubDModVal(xlApp As Microsoft.Office.Interop.Excel.Application, row As String, title As String, name As String, weight As Double, number As Double)
         If number > 0 Then
             DctVal(xlApp, $"X{row}", title)
@@ -259,14 +346,14 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Publish double mod value expansion to excel.
+    ''' Ghi một dòng thép tùy biến có cả trọng lượng và đơn giá.
     ''' </summary>
-    ''' <param name="xlApp">Excel application.</param>
-    ''' <param name="row">Row number.</param>
-    ''' <param name="name">Name rebar.</param>
-    ''' <param name="weight">Weight rebar.</param>
-    ''' <param name="price">Price rebar.</param>
-    ''' <param name="number">Number rebar.</param>
+    ''' <param name="xlApp">Ứng dụng Excel đang mở.</param>
+    ''' <param name="row">Số dòng trong mẫu Excel.</param>
+    ''' <param name="name">Tên hoặc quy cách thép.</param>
+    ''' <param name="weight">Trọng lượng đơn vị.</param>
+    ''' <param name="price">Đơn giá.</param>
+    ''' <param name="number">Số lượng.</param>
     Friend Sub PubDModVal(xlApp As Microsoft.Office.Interop.Excel.Application, row As String, name As String, weight As Double, price As Double, number As Double)
         If number > 0 Then
             DctVal(xlApp, $"AH{row}", name)
@@ -279,7 +366,7 @@ Friend Module Common
 
 #Region "Timer"
     ''' <summary>
-    ''' Start timer advanced.
+    ''' Bật timer nếu timer chưa chạy.
     ''' </summary>
     <Extension()>
     Friend Sub StrtAdv(tmr As Timer)
@@ -289,7 +376,7 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Stop timer advanced.
+    ''' Tắt timer nếu timer đang chạy.
     ''' </summary>
     <Extension()>
     Friend Sub StopAdv(tmr As Timer)
@@ -301,106 +388,106 @@ Friend Module Common
 
 #Region "Actor"
     ''' <summary>
-    ''' Header style.
+    ''' In nội dung cấp header bằng màu cảnh báo nhẹ.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Private Sub HdrSty(caption As String)
         ForegroundColor = DarkYellow
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Intro style.
+    ''' In nội dung giới thiệu bằng màu xanh dương.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Private Sub IntroSty(caption As String)
         ForegroundColor = Blue
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Title style.
+    ''' In tiêu đề bằng màu xanh lá.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Private Sub TitSty(caption As String)
         ForegroundColor = Green
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Input style.
+    ''' In nhãn nhập liệu bằng màu cyan.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Private Sub InpSty(caption As String)
         ForegroundColor = Cyan
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Description style.
+    ''' In mô tả bổ sung bằng màu magenta.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Private Sub DescSty(caption As String)
         ForegroundColor = Magenta
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Warning style.
+    ''' In cảnh báo hoặc câu hỏi lựa chọn bằng màu vàng.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Private Sub WrngSty(caption As String)
         ForegroundColor = Yellow
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Error style.
+    ''' In lỗi bằng màu đỏ.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cần in.</param>
     Friend Sub ErrSty(caption As String)
         ForegroundColor = Red
         Write(caption)
     End Sub
 
     ''' <summary>
-    ''' Prefix input.
+    ''' In prefix cho dòng nhập liệu rồi trả màu chữ về trắng.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nhãn nhập liệu.</param>
     Private Sub PrefInp(caption As String)
         InpSty(caption)
         ForegroundColor = White
     End Sub
 
     ''' <summary>
-    ''' Prefix select.
+    ''' In prefix cho dòng chọn 0/1 rồi trả màu chữ về trắng.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nhãn lựa chọn.</param>
     Private Sub PrefSel(caption As String)
         WrngSty(caption)
         ForegroundColor = White
     End Sub
 
     ''' <summary>
-    ''' Prefix warning.
+    ''' In lại prefix khi giá trị nhập không hợp lệ.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nhãn lựa chọn.</param>
     Private Sub PrefWrng(caption As String)
         WrngSty(caption)
         ForegroundColor = Red
     End Sub
 
     ''' <summary>
-    ''' Suffix description.
+    ''' In mô tả nằm sau nhãn nhập liệu.
     ''' </summary>
-    ''' <param name="description">Description.</param>
+    ''' <param name="description">Mô tả bổ sung.</param>
     Private Sub SfxDesc(description As String)
         DescSty(description)
         PrefInp(": ")
     End Sub
 
     ''' <summary>
-    ''' Intro.
+    ''' Xóa màn hình và in banner ứng dụng trước mỗi cụm nhập liệu lớn.
     ''' </summary>
     Private Sub Intro()
         Clear()
@@ -410,71 +497,73 @@ Friend Module Common
     End Sub
 
     ''' <summary>
-    ''' Header double input.
+    ''' Hiển thị banner rồi đọc một số từ người dùng.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    ''' <returns>Input value.</returns>
-    Friend Function HdrDInp(caption As String)
+    ''' <param name="caption">Nhãn nhập liệu.</param>
+    ''' <returns>Giá trị số người dùng nhập.</returns>
+    Friend Function HdrDInp(caption As String) As Double
         Intro()
         Return DtlDInp(caption)
     End Function
 
     ''' <summary>
-    ''' Header string warning.
+    ''' Hiển thị banner rồi in cảnh báo/chủ đề của nhóm nhập liệu.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
+    ''' <param name="caption">Nội dung cảnh báo hoặc tiêu đề nhóm.</param>
     Friend Sub HdrWrng(caption As String)
         Intro()
         WrngSty(caption)
     End Sub
 
     ''' <summary>
-    ''' Header double warning.
+    ''' Hiển thị banner, đọc lựa chọn số lần đầu với màu cảnh báo.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    Friend Function HdrDWrng(caption As String)
+    ''' <param name="caption">Nhãn lựa chọn.</param>
+    ''' <returns>Giá trị số người dùng nhập.</returns>
+    Friend Function HdrDWrng(caption As String) As Double
         Intro()
         PrefSel(caption)
         Return Val(ReadLine)
     End Function
 
     ''' <summary>
-    ''' Header double error.
+    ''' Hiển thị banner và đọc lại lựa chọn số khi lần nhập trước không hợp lệ.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    Friend Function HdrDErr(caption As String)
+    ''' <param name="caption">Nhãn lựa chọn.</param>
+    ''' <returns>Giá trị số người dùng nhập.</returns>
+    Friend Function HdrDErr(caption As String) As Double
         Intro()
         PrefWrng(caption)
         Return Val(ReadLine)
     End Function
 
     ''' <summary>
-    ''' Detail double input.
+    ''' Đọc một giá trị số ở dòng nhập liệu chi tiết.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    ''' <returns>Input value.</returns>
-    Friend Function DtlDInp(caption As String)
+    ''' <param name="caption">Nhãn nhập liệu.</param>
+    ''' <returns>Giá trị số người dùng nhập.</returns>
+    Friend Function DtlDInp(caption As String) As Double
         PrefInp(caption)
         Return Val(ReadLine)
     End Function
 
     ''' <summary>
-    ''' Detail string input.
+    ''' Đọc một chuỗi ở dòng nhập liệu chi tiết.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    ''' <returns>Input value.</returns>
-    Friend Function DtlSInp(caption As String)
+    ''' <param name="caption">Nhãn nhập liệu.</param>
+    ''' <returns>Chuỗi người dùng nhập.</returns>
+    Friend Function DtlSInp(caption As String) As String
         PrefInp(caption)
-        Return ReadLine.ToString()
+        Return If(ReadLine(), String.Empty)
     End Function
 
     ''' <summary>
-    ''' Detail double input description.
+    ''' Đọc một giá trị số ở dòng nhập liệu chi tiết có mô tả phụ.
     ''' </summary>
-    ''' <param name="caption">Caption.</param>
-    ''' <param name="description">Description.</param>
-    ''' <returns>Input value.</returns>
-    Friend Function DtlDInpDesc(caption As String, description As String)
+    ''' <param name="caption">Nhãn nhập liệu.</param>
+    ''' <param name="description">Mô tả phụ.</param>
+    ''' <returns>Giá trị số người dùng nhập.</returns>
+    Friend Function DtlDInpDesc(caption As String, description As String) As Double
         InpSty(caption)
         SfxDesc(description)
         Return Val(ReadLine)
